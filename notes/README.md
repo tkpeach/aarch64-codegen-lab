@@ -16,11 +16,12 @@
 
 | 一次学习 | 时间参考 | 本次完成的综合产出 |
 | --- | --- | --- |
+| [基础专题 · ARM64 主要指令与实例](../learning/checkpoints/Unit-4.html) | 90–120 分钟 | 用寄存器、访存地址和 NZCV 逐步恢复一个数组循环，再追踪函数调用与返回 |
 | [专题一 · 从 IR 到两条选择路径](../learning/checkpoints/Unit-1.html) | 2–3 小时 | 用 DAG、GlobalISel 和最终汇编解释相同指令怎样形成，预测改变移位量来源的影响 |
 | [专题二 · 加数的表示与编码边界](../learning/checkpoints/Unit-2.html) | 90–120 分钟 | 在 W/X 形式间对齐立即数字段，用两组反例分别检验对齐和容量 |
 | [专题三 · 从陌生算式到复验报告](../learning/checkpoints/Unit-3.html) | 约 2 小时 | 从消费者追踪改写首次发生的位置，给出独立预测、相邻阶段证据和交接记录 |
 
-三份[专题一](../learning/checkpoints/Unit-1.md)、[专题二](../learning/checkpoints/Unit-2.md)、[专题三](../learning/checkpoints/Unit-3.md)综合作答记录均为待答。原日课供回看具体讲解和原答。
+[基础专题](../learning/checkpoints/Unit-4.md)、[专题一](../learning/checkpoints/Unit-1.md)、[专题二](../learning/checkpoints/Unit-2.md)、[专题三](../learning/checkpoints/Unit-3.md)综合作答记录均为待答。原日课供回看具体讲解和原答。
 
 ## 笔记索引
 

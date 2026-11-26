@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ARM64 主要指令 · 从寄存器到数组循环</title>
+  <style>
+    :root { color-scheme: light dark; font: 17px/1.75 system-ui, sans-serif; }
+    body { margin: 0; }
+    main { max-width: 46rem; margin: auto; padding: 2rem 1.25rem 4rem; }
+    h1, h2, h3 { line-height: 1.3; }
+    section { margin-top: 2rem; }
+    pre { overflow: auto; padding: .75rem 1rem; background: color-mix(in srgb, CanvasText 7%, Canvas); border-radius: .4rem; }
+    code, pre { font-family: ui-monospace, monospace; }
+    label { display: block; margin: 1.2rem 0 .4rem; font-weight: 650; }
+    textarea { display: block; box-sizing: border-box; width: 100%; min-height: 6rem; padding: .6rem; font: inherit; font-family: ui-monospace, monospace; resize: vertical; }
+    .save-bar { position: sticky; top: 0; padding: .5rem 0; background: Canvas; }
+    button { margin-top: 1.2rem; padding: .5rem .85rem; font: inherit; cursor: pointer; }
+  </style>
+</head>
+<body>
+<main>
+<h1>ARM64 主要指令：读懂一个数组循环</h1>
+<p>基础专题 · 约 90–120 分钟 · 可在专题一之前阅读</p>
+<p><strong>拿到一段 A64 汇编，怎样从寄存器、内存、条件标志和下一条执行位置，恢复函数的行为？</strong> 学完后提交一张循环执行表，并用一对反例解释读错位宽或标志来源会造成什么后果。</p>
+<nav><a href="#registers">寄存器</a> · <a href="#alu">整数与位运算</a> · <a href="#memory">访存</a> · <a href="#loop">条件与循环</a> · <a href="#call">函数调用</a> · <a href="#vector">浮点与向量</a> · <a href="#lab">复验</a> · <a href="#exercise">集中作答</a></nav>
+<section id="registers"><h2>先确定操作数代表什么</h2>
+<p>ARM64 通常指 AArch64，本课读的是它的 A64 指令。遇到一行汇编，先圈出读取的值，再标出写回位置。多数算术指令把目的寄存器写在第一项；<code>str w8, [x0]</code> 的第一项却是要存入内存的数据，而 <code>cmp</code> 写的是隐含的标志。</p>
+<ul>
+<li><code>x0…x30</code> 是 64 位通用寄存器，<code>w0…w30</code> 是对应的低 32 位视图。写 W 会把对应 X 的高 32 位清零。例如原来 x8 全是 1，执行 <code>mov w8, #1</code> 后，整个 x8 等于 1。</li>
+<li><code>xzr/wzr</code> 读作零，写入结果被丢弃。<code>sp</code> 指向当前栈顶。立即数前缀 <code>#</code>，方括号表示访问该地址的内存。</li>
+<li>在本课 Linux AArch64 调用约定中，简单的整数和指针参数依次从 x0–x7 传入，整数结果从 x0 或 w0 返回。<code>x30</code> 也叫 LR，保存链接地址。浮点和向量参数另走 SIMD/FP 寄存器。<a href="https://github.com/ARM-software/abi-aa/blob/main/aapcs64/aapcs64.rst">Arm AAPCS64，Machine Registers 与 Parameter Passing</a></li>
+</ul></section>
+<section id="alu"><h2>算术与位运算：看一个数怎样流过三条指令</h2>
+<p><code>mix(a,b,c)</code> 计算 <code>((a &lt;&lt; 3) ^ (b &amp; 255)) + c</code>。在下列编译输出中，假设 x0=3、x1=0x10f、x2=5。</p>
+<pre><code>and  x8, x1, #0xff       // x8 = 0x0f，只留下低 8 位
+eor  x8, x8, x0, lsl #3  // x8 = 0x0f XOR 0x18 = 0x17
+add  x0, x8, x2          // x0 = 0x1c，即 28
+ret</code></pre>
+<p><code>and</code> 取两边共同置位的位，<code>orr</code> 合并置位，<code>eor</code> 保留不同的位。这里 <code>lsl #3</code> 修饰 EOR 的右操作数，x0 此时仍为 3。要判断能否把两行 IR 放进一条机器指令，先看消费者允许怎样修饰输入。</p>
+<p><code>lsl</code> 左移补零，<code>lsr</code> 右移补零，<code>asr</code> 右移复制符号位。按 32 位计算，0x80000000 右移一位，逻辑结果为 0x40000000，算术结果为 0xc0000000。正数 8 右移时两者同为 4，因此只测正数无法区分它们。</p>
+<p><code>sub</code> 做减法，<code>mul</code> 保留乘积的低目标位宽，<code>madd xd,xn,xm,xa</code> 计算 xn × xm + xa。实测 <code>scaled(3,5)</code> 的函数体为 <code>mul x0,x0,x1</code> 和 <code>ret</code>。同一目标文件关闭别名显示后，乘法写成 <code>madd x0,x0,x1,xzr</code>。把零代入第四项，便能解释两种拼写为什么对应同一条编码。</p>
+<p>扩展到宽整数时，<code>adds</code> 在加法后写 NZCV，<code>adc</code> 把当前进位 C 加入下一段。以两个 64 位字表示 128 位数，低字全为 1 再加 1，低字回到 0、C=1，高字用 ADC 加上这 1。对应的机器指令与进位边见<a href="Unit-1.html#wide">宽位加法实测</a>。</p></section>
+<section id="memory"><h2>访存：用地址、宽度、写回解释 LDR 和 STR</h2>
+<p><code>bump(p,i)</code> 给一个 32 位数组元素加 1。假设 p=0x1000，i=2，地址 0x1008 中的 32 位值为 9。</p>
+<pre><code>ldr w8, [x0, x1, lsl #2]   // 地址 = 0x1000 + (2 × 4)，取 4 字节
+add w8, w8, #1            // w8 = 10；此时内存仍是 9
+str w8, [x0, x1, lsl #2]   // 地址 0x1008 的 4 字节更新为 10
+ret</code></pre>
+<p>方括号内的移位把元素索引换算成字节偏移。此形式保留 x0。另一种 <code>ldrsw x9,[x0],#4</code> 先从旧 x0 读 4 字节，符号扩展到 64 位，再让 x0 前进 4。若内存的位模式为 0xfffffffe，<code>ldr w9,[x0]</code> 得到 x9=0x00000000fffffffe，LDRSW 得到 x9=0xfffffffffffffffe。两者读了同样多的字节，差别在写入目的寄存器时如何扩展。</p>
+<p>常见变体还有 <code>ldrb/strb</code>（1 字节）、<code>ldrh/strh</code>（2 字节）和 <code>ldp/stp</code>（连续读写两个寄存器的值）。例如 <code>stp x29,x30,[sp,#-16]!</code> 先减小 SP，再将两个 64 位值依次存到新 SP 与新 SP+8。</p></section>
+<section id="loop"><h2>把指令连起来：累加数组中的正数</h2>
+<p><code>positive_sum(p,n)</code> 的 x0 是第一个 32 位有符号元素的地址，x1 是元素个数。以下为实际输出，标签按作用重命名。</p>
+<pre><code>    mov   x8, xzr
+    cbz   x1, done
+loop:
+    ldrsw x9, [x0], #4
+    cmp   w9, #0
+    csel  x9, x9, xzr, gt
+    subs  x1, x1, #1
+    add   x8, x8, x9
+    b.ne  loop
+done:
+    mov   x0, x8
+    ret</code></pre>
+<p>用数组 <code>[-2,5]</code> 走一遍。初始 x8=0，x1=2。第一轮 LDRSW 读到 −2，CMP 按 32 位计算与零的差并更新标志；CSEL 看到有符号 GT 不成立，选 xzr。计数减为 1，累加器仍为 0，跳回。第二轮读到 5，CSEL 保留 5，计数减为 0，累加器变成 5，循环退出并返回 5。如果 n 初始为 0，CBZ 直接跳到 done，全程没有读取数组。</p>
+<p>NZCV 的四位依次表示负、零、无符号进位以及有符号溢出。<code>cmp w9,#0</code> 等价于 <code>subs wzr,w9,#0</code>；丢弃差值，保留标志。<code>gt</code> 检查 Z=0 且 N=V；无符号“大于”用 <code>hi</code>，检查 C=1 且 Z=0。把负数的位模式当作无符号数比较，会改变保留下来的元素。</p>
+<p>沿两条隐含依赖分别划线：CMP → CSEL 决定累加哪个数；SUBS → B.NE 决定是否继续。中间普通 ADD 保留标志，所以 B.NE 读到计数器的 Z。<code>cbz/cbnz</code> 则直接测试一个寄存器是否为零；<code>b label</code> 无条件改变执行位置。</p></section>
+<section id="call"><h2>调用：为什么要保存 x30</h2>
+<pre><code>call_scaled:
+    str x30, [sp, #-16]!
+    bl  scaled
+    sub x0, x0, #1
+    ldr x30, [sp], #16
+    ret</code></pre>
+<p>沿 <code>call_scaled(3,5)</code> 跟踪：先把 SP 减 16，把入站返回地址写入新栈顶的 8 字节，栈保持 16 字节对齐。BL 跳到 scaled，并把下一条 SUB 的地址写入 x30。scaled 的 RET 依此回到 SUB，此时 x0=15。减一得到 14，从栈恢复原 x30，再把 SP 加 16。末尾 RET 默认跳到 x30，从而回到外层调用者。</p>
+<p>比较两个寻址符号：<code>[sp,#-16]!</code> 在访问之前更新 SP，<code>[sp],#16</code> 在访问之后更新 SP。<code>bl</code> 调用已知目标，若目标地址在寄存器中，可用 <code>blr xN</code>；<code>br xN</code> 跳转并保留现有链接地址。</p></section>
+<section id="vector"><h2>相同的“加”，数据类型可以不同</h2>
+<pre><code>double_add:  fadd d0, d0, d1
+             ret
+lanes:       add  v0.4s, v0.4s, v1.4s
+             ret</code></pre>
+<p>第一例把两个双精度标量相加，1.5 与 2.25 得到 3.75。第二例把每个 128 位向量分成四个 32 位整数通道，逐通道相加。[1,2,3,4] 加上 [10,20,30,40] 得到 [11,22,33,44]。某个通道溢出的进位不会流入邻居。读指令时把操作数写法和助记符一起看，<code>add x0,…</code> 与 <code>add v0.4s,…</code> 操作的数据布局不同。</p></section>
+<section id="lab"><h2>复验与源码阅读</h2>
+<p>七个完整函数在<a href="../../experiments/arm64-basics.ll">实验 IR</a>。从根目录运行，工具取自 LLVM 22.1.8 的 PATH，或用 LLC、LLVM_MC、LLVM_OBJDUMP 指定路径。先在 basics.s 中按函数名找最终汇编，再回到 isel.txt 看选择后的依赖。encoding.txt 保留无别名反汇编和重定位信息，便于核对 MUL、CMP 与 BL 的目标。</p>
+<pre><code>out=evidence/arm64-basics
+mkdir -p "$out"
+"${LLC:-llc}" -mtriple=aarch64-unknown-linux-gnu -mcpu=generic -O2 \
+  -global-isel=0 -fast-isel=0 -verify-machineinstrs -print-after=aarch64-isel \
+  experiments/arm64-basics.ll -o "$out/basics.s" 2&gt; "$out/isel.txt"
+"${LLVM_MC:-llvm-mc}" -triple=aarch64-unknown-linux-gnu -filetype=obj \
+  "$out/basics.s" -o "$out/basics.o"
+"${LLVM_OBJDUMP:-llvm-objdump}" -dr --disassembler-options=no-aliases \
+  "$out/basics.o" &gt; "$out/encoding.txt"</code></pre>
+<p>上述汇编、目标文件和反汇编来自 Linux AArch64 目标。另将同一份 IR 编译为本机 macOS arm64 目标并调用七个函数，核对了正文的算术、循环、写回、调用、浮点和向量示例。虚拟地址 0x1000 和 0x2000 用于纸上走读。</p>
+<p>在 positive_sum 的选择后日志定位 <code>LDRSWpost</code>、<code>SUBSWri</code> 与 <code>CSELXr</code>，对照最后两条的 <code>implicit-def $nzcv</code> 和 <code>implicit $nzcv</code>。再到固定版本的指令定义搜索 <code>defm SUBS</code> 和 <code>CSEL</code>，核对目标指令读取或定义哪些操作数；在无别名反汇编中找出丢弃比较结果的目的寄存器。<a href="https://github.com/llvm/llvm-project/blob/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/Target/AArch64/AArch64InstrInfo.td">LLVM 22.1.8 AArch64 指令定义</a></p></section>
+<section id="exercise"><h2>集中作答</h2>
+<p>给定输入：positive_sum 的数组从 0x2000 开始，内容为三个 32 位字 <code>[0x80000000, 0, 7]</code>，n=3。使用上面的完整循环。先保存预测，再逐行复核。</p>
+<form id="answers"><p id="save-status" role="status">在 Learning Checkpoint 编辑器或本地课程服务中填写并保存。</p>
+<label for="trace">1. 提交一张循环执行表。</label><p>从访存方式和循环体取证。每轮写出读地址、加载后的 x9、CSEL 后的 x9、SUBS 后的 Z、x8 和下一跳。最后写出返回值。</p>
+<textarea readonly id="trace" name="trace" rows="6"></textarea>
+<label for="condition">2. 哪一个改动会改变结果？</label><p>对同一输入分别预测：只把 LDRSW 改为 LDR W9（保留后索引 #4）；只把 CSEL 的 GT 改为 HI。分别指出第一处状态差异，以及它是否能传到返回值。注意 CMP 的位宽。</p>
+<textarea readonly id="condition" name="condition" rows="5"></textarea>
+<label for="flags">3. 怎样证明回边读的是计数器？</label><p>沿原循环给出两对标志生产者与消费者。假设只把最后的 ADD 换成 ADDS，写出第一次分支的变化，用 Z 和下一跳说明因果。</p>
+<textarea readonly id="flags" name="flags" rows="5"></textarea>
+<label for="return">4. 解释两次 RET 为什么回到不同位置。</label><p>对 call_scaled(6,7)，给入站返回地址命名 R、BL 后的地址命名 K。沿调用示例依次写出栈顶保存的值、两次 RET 的目标和最后的 x0，再用无别名反汇编解释被调函数的乘法。</p>
+<textarea readonly id="return" name="return" rows="5"></textarea>
+</form></section></main>
+<script src="../answers.js"></script>
+</body></html>
