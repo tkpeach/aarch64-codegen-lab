@@ -1,0 +1,5 @@
+/.venv/
+/.foundation/*.whl
+/evidence/
+/.foundation/events.sqlite3*
+/.foundation/events.jsonl.*

@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>第 3 天 · GlobalISel 与 SelectionDAG</title>
+  <style>
+    :root { color-scheme: light dark; font: 17px/1.75 system-ui, sans-serif; }
+    body { margin: 0; }
+    main { max-width: 46rem; margin: auto; padding: 2rem 1.25rem 4rem; }
+    h1, h2, h3 { line-height: 1.3; }
+    section { margin-top: 2rem; }
+    pre { overflow: auto; padding: .75rem 1rem; background: color-mix(in srgb, CanvasText 7%, Canvas); border-radius: .4rem; }
+    code, pre { font-family: ui-monospace, monospace; }
+    label { display: block; margin: 1.2rem 0 .4rem; font-weight: 650; }
+    textarea { display: block; box-sizing: border-box; width: 100%; min-height: 6rem; padding: .6rem; font: inherit; font-family: ui-monospace, monospace; resize: vertical; }
+    .save-bar { position: sticky; top: 0; padding: .5rem 0; background: Canvas; }
+    button { margin-top: 1.2rem; padding: .5rem .85rem; font: inherit; cursor: pointer; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>相同的汇编，两条指令选择路径</h1>
+  <p>第 3 天 · P2 · GlobalISel 与 SelectionDAG · 约 60–75 分钟</p>
+  <p><a href="#lesson">读懂窄基线</a>（15 分钟） · <a href="#wide">拆解宽运算</a>（20–25 分钟） · <a href="#run">复验</a>与<a href="#exercise">综合作答</a>（25–35 分钟）</p>
+  <section aria-labelledby="why-globalisel">
+    <h2 id="why-globalisel">为什么在这一阶段看 GlobalISel</h2>
+    <p>P1 已用 SelectionDAG 建立基线，回答了带移位的加法怎样匹配到 AArch64 指令。P2 保留相同输入和目标参数，在明确指定 <code>-global-isel</code> 的运行中观察另一条路径。这样可以用同一结果追问两个问题：相同的目标指令在两条路径里是从什么中间表示得到的？怎样用阶段证据确认实际走了哪条路径？</p>
+    <p>GlobalISel 的通用机器指令可以在翻译、合法化、寄存器组选择和指令选择后分别保存成 MIR。窄例用于对齐两条路径的选择后边界，宽例用于区分合法化拆分和指令选择折叠。SelectionDAG 仍作为对照基线。本节的结论限于固定的 LLVM 版本、目标参数和输入。</p>
+  </section>
+
+  <section aria-labelledby="goal">
+    <h2 id="goal">总问题</h2>
+    <p>同一个 <code>a + (b &lt;&lt; 3)</code> 在两条路径都编译成带移位的 <code>add</code>。你怎样用阶段证据说明两条路径各自做了什么，在哪个边界得到相同的机器指令，并确认 GlobalISel 没有回退？</p>
+    <p><strong>综合产出。</strong>写一段可用于代码评审的结论。先陈述同一输入在各阶段的表示，再用输出定位折叠边界，最后给出确认路径和限定观察范围的证据。还要用宽位对照检验这个结论的边界。最后把五个小问收束成一段可引用的结论。</p>
+  </section>
+
+  <section aria-labelledby="lesson">
+    <h2 id="lesson">先看两条路径怎样记录同一条依赖</h2>
+    <p>SelectionDAG 在选择前通过 <code>SDNode</code> 和 <code>SDValue</code> 表示运算与依赖，选择并调度后发出 MachineInstr。GlobalISel 从 <code>IRTranslator</code> 开始就在 <code>MachineFunction</code> 里使用通用 MachineInstr。例如本例的常量、移位和加法分别是 <code>G_CONSTANT</code>、<code>G_SHL</code>、<code>G_ADD</code>。注册 pass 的两个入口可在同一个 AArch64 源文件中对照。<a href="https://github.com/llvm/llvm-project/blob/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/Target/AArch64/AArch64TargetMachine.cpp#L649-L699">LLVM 22.1.8 的 AArch64 pass 配置</a></p>
+    <h3 id="mir-register">怎样读 <code>%26:_(s64)</code></h3>
+    <p>这是 <code>llc -stop-after=legalizer</code> 保存的 <strong>Machine IR（MIR）</strong> 中的虚拟寄存器定义。宽例的 <code>.ll</code> 源文件写的是 <code>%shifted = shl i128 %b, 3</code>。生成的 <code>.mir</code> 文件开头可以嵌入一份 LLVM IR，而 <code>body:</code> 下面是机器基本块。形如 <code>%26:_(s64) = G_SHL …</code> 的行出现在 <code>body:</code> 里。</p>
+    <ul>
+      <li><code>%26</code> 是本机器函数里的虚拟寄存器编号。</li>
+      <li><code>_</code> 占据寄存器组或寄存器类的标注位置。这一行所在的阶段还没给它指定 register bank 或 class。</li>
+      <li><code>(s64)</code> 是 GlobalISel 的低层类型（LLT），表示 64 位标量。这里的 <code>s</code> 是 scalar。</li>
+    </ul>
+    <p>窄例能看清格式如何随阶段变化。IRTranslator 后的移位结果写作 <code>%3:_(s64)</code>，RegBankSelect 后写作 <code>%3:gpr(s64)</code>。选择后，融合出来的 <code>ADDXrs</code> 结果写作 <code>%4:gpr64</code>，其中 <code>gpr64</code> 是 AArch64 的寄存器类，<code>%4</code> 仍是虚拟寄存器编号。第一阶段常看的正是选择后的机器指令，因此直接看到了寄存器类的写法。<a href="https://llvm.org/docs/MIRLangRef.html">MIR 格式参考</a> · <a href="https://llvm.org/docs/GlobalISel/GMIR.html">GlobalISel 通用 MIR</a></p>
+    <table>
+      <thead><tr><th>截取位置</th><th>本次看到什么</th></tr></thead>
+      <tbody>
+        <tr><td>IRTranslator 后</td><td><code>G_SHL</code> 的结果被 <code>G_ADD</code> 使用。<code>_(s64)</code> 表示通用虚拟寄存器带有低层类型，此时尚未选择 register bank。</td></tr>
+        <tr><td>Legalizer 后</td><td>这两条运算仍在，<code>legalized</code> 变为 <code>true</code>。这组输入的运算在这个截点没有拆开。</td></tr>
+        <tr><td>RegBankSelect 后</td><td>运算仍是 <code>G_SHL</code> 和 <code>G_ADD</code>，标注变成 <code>gpr(s64)</code>。此处选择的是寄存器组，虚拟寄存器仍存在。</td></tr>
+        <tr><td>InstructionSelect 后</td><td>两个通用运算已由一条目标指令 <code>ADDXrs</code> 覆盖，结果标注寄存器类 <code>gpr64</code>。</td></tr>
+        <tr><td>AArch64 SelectionDAG ISel 后</td><td>同样看到 <code>ADDXrs</code>。这里应对比 opcode 和操作数形状。这个 dump 的 <code>selected</code> 仍是 <code>false</code>，该字段不能跨路径当作是否已观察到目标指令的判据。</td></tr>
+      </tbody>
+    </table>
+    <h3 id="shift-folding">折叠指什么，怎样读 ADDXrs</h3>
+    <p>这里的「折叠」指<strong>把移位吸收到加法的第二个操作数里</strong>。RegBankSelect 后，<code>G_SHL</code> 产生临时值 <code>%3</code>，由下一条 <code>G_ADD</code> 读取。InstructionSelect 后，移位量 <code>3</code> 成了 <code>ADDXrs</code> 的操作数，原来的移位结果在本例中只供加法使用，因此不需要单独的机器指令来产生它。</p>
+    <pre><code>RegBankSelect 后
+%3:gpr(s64) = G_SHL %1, %2(s64)  // %2 是常量 3
+%4:gpr(s64) = G_ADD %0, %3
+
+InstructionSelect 后
+%4:gpr64 = ADDXrs %0, %1, 3
+
+最终汇编
+add x0, x0, x1, lsl #3</code></pre>
+    <p><code>ADDXrs</code> 是 LLVM 对 AArch64 64 位 <code>ADD (shifted register)</code> 的机器 opcode。<code>X</code> 对应 64 位，<code>rs</code> 表示带移位的寄存器形式。<code>lsl #3</code> 修饰第二个输入寄存器 <code>x1</code>，这条指令计算 <code>a + (b &lt;&lt; 3)</code> 并保留低 64 位，与本例两条 <code>i64</code> IR 的结果一致。例如 <code>a = 5</code>、<code>b = 2</code> 时，结果是 <code>5 + 16 = 21</code>。<a href="https://github.com/llvm/llvm-project/blob/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/Target/AArch64/AArch64InstrInfo.td#L2708">ADD 定义入口</a> · <a href="https://github.com/llvm/llvm-project/blob/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/Target/AArch64/AArch64InstrFormats.td#L3118-L3126">Xrs 指令形式</a></p>
+    <p><strong>先用阶段输出做一次判断。</strong>在 RegBankSelect 后还能看到两条通用计算，在 InstructionSelect 后已看到一条目标计算。这一对截点把折叠定位在两者之间。单看最终汇编，无法知道是哪条路径完成了同一件事。完整 GlobalISel 运行启用 <code>-global-isel-abort=1</code>，遇到选择失败就中止，并用 pass 日志核对实际路径。</p>
+  </section>
+
+  <section aria-labelledby="wide">
+    <h2 id="wide">位宽对照 · 观察合法化怎样拆分宽运算</h2>
+    <p>保持表达式和移位量 <code>3</code>，把所有数据运算从 <code>i64</code> 加宽为 <code>i128</code>。在两条路径中仍使用同一 triple、CPU 和优化级别。<a href="../../experiments/add-shift-wide.ll">完整 i128 IR</a></p>
+    <pre><code>define i128 @add_shift_wide(i128 %a, i128 %b) {
+entry:
+  %shifted = shl i128 %b, 3
+  %sum = add i128 %a, %shifted
+  ret i128 %sum
+}</code></pre>
+    <h3>从 IRTranslator 到 Legalizer</h3>
+    <p>IRTranslator 后仍有 <code>s128</code> 的 <code>G_SHL</code> 和 <code>G_ADD</code>。Legalizer 后，观察到下列 <code>s64</code> 运算。这里 <code>%2/%3</code> 是 <code>a</code> 的低/高半部，<code>%4/%5</code> 是 <code>b</code> 的低/高半部。</p>
+    <pre><code>%26:_(s64) = G_SHL %4, %25(s64)
+%27:_(s64) = G_SHL %5, %25(s64)
+%28:_(s64) = G_CONSTANT i64 61
+%29:_(s64) = G_LSHR %4, %28(s64)
+%30:_(s64) = G_OR %27, %29
+%15:_(s64), %21:_(s32) = G_UADDO %2, %26
+%17:_(s64), %20:_(s32) = G_UADDE %3, %30, %21</code></pre>
+    <p><code>%25</code> 是常量 <code>3</code>。高半部要接收从低半部移出的 3 位，所以右移量是 <code>64 − 3 = 61</code>。<code>G_UADDO</code> 另产出进位 <code>%21</code>，<code>G_UADDE</code> 把它作为高半部加法的输入。这些依赖在合法化截点已可观察。</p>
+    <h3 id="carry">两条加法怎样传递进位</h3>
+    <p><code>G_UADDO</code> 和 <code>G_UADDE</code> 都是 GlobalISel 的通用机器指令。<code>G_UADDO</code> 加两个数，产出截断后的和以及无符号进位。<code>G_UADDE</code> 还读取上一段的进位，把它作为 0 或 1 加进去，同样产出和与进位。本例低位用前者，高位用后者。高位的进位 <code>%20</code> 没有使用者，因为原运算只返回低 128 位。<a href="https://llvm.org/docs/GlobalISel/GenericOpcode.html">通用 opcode 定义</a></p>
+    <p>进位的有效信息只有 1 位。<code>LegalizerHelper::narrowScalarAddSub</code> 拆宽加法时先用 <code>LLT::scalar(1)</code> 建立进位值。这个版本的 AArch64 合法化规则对这组 opcode 接受 <code>{s64, s32}</code>（64 位和、32 位进位），并把进位类型的最小宽度限制为 32 位。所以 Legalizer 后看到 <code>%21:_(s32)</code>。<code>s32</code> 是此处 MIR 的表示宽度，进入选好的机器指令后，本例用 <code>NZCV.C</code> 传递这一位。<a href="https://github.com/llvm/llvm-project/blob/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/CodeGen/GlobalISel/LegalizerHelper.cpp#L7077-L7153">宽运算拆分</a> · <a href="https://github.com/llvm/llvm-project/blob/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/Target/AArch64/GISel/AArch64LegalizerInfo.cpp#L298-L303">AArch64 合法类型规则</a></p>
+    <h3>选择后对照 · 相同的低位折叠，略有差异的高位指令</h3>
+    <table>
+      <thead><tr><th>观察位置</th><th>GlobalISel</th><th>SelectionDAG</th></tr></thead>
+      <tbody>
+        <tr><td>选择后的计算</td><td><code>EXTRXrri</code>、<code>ADDSXrs</code>、<code>ADCSXr</code></td><td><code>EXTRXrri</code>、<code>ADDSXrs</code>、<code>ADCXr</code></td></tr>
+        <tr><td>最终汇编的计算</td><td><code>extr</code>、<code>adds</code>、<code>adc</code></td><td><code>extr</code>、<code>adds</code>、<code>adc</code></td></tr>
+      </tbody>
+    </table>
+    <h4 id="wide-opcodes">读懂三个 AArch64 机器 opcode</h4>
+    <ol>
+      <li><code>EXTRXrri</code> 对应 <code>extr x8, x3, x2, #61</code>。把 <code>x3:x2</code> 看作高、低各 64 位的拼接，从整体的第 61 位起取 64 位，得到 <code>(b_hi &lt;&lt; 3) | (b_lo &gt;&gt; 61)</code> 的低 64 位。这就是宽移位后的高半部。</li>
+      <li><code>ADDSXrs</code> 对应 <code>adds x0, x0, x2, lsl #3</code>。它把 <code>b_lo &lt;&lt; 3</code> 和 <code>a_lo</code> 相加，写出低半部，并更新 <code>NZCV</code>。其中 <code>C</code> 保存低半部加法的无符号进位。</li>
+      <li><code>ADCSXr</code> 对应助记符 <code>adcs</code>。它计算 <code>a_hi + shifted_b_hi + C</code>，读取输入进位并再次更新 <code>NZCV</code>。<code>ADCXr</code> 对应 <code>adc</code>，执行同样的带进位加法并保留原标志。本例高半部产生的标志不再使用，最终汇编发出 <code>adc x1, x1, x8</code>。</li>
+    </ol>
+    <p>这三个名字是 LLVM 的目标机器 opcode。<code>X</code> 对应 64 位形式，<code>rri</code> 对应两个寄存器输入加立即数，<code>rs</code> 对应带移位的寄存器形式。<a href="https://github.com/llvm/llvm-project/blob/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/Target/AArch64/AArch64InstrInfo.td#L2699-L2725">ADC 和 ADDS 定义</a> · <a href="https://github.com/llvm/llvm-project/blob/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/Target/AArch64/AArch64InstrFormats.td#L3327-L3342">EXTR 指令格式</a></p>
+    <h4 id="extract-and-flags">EXTR 取哪一段，调度如何保住进位</h4>
+    <p><code>extr x8, x3, x2, #61</code> 把第一项输入 <code>x3</code> 放在拼接值的高 64 位，把第二项 <code>x2</code> 放在低 64 位。从最低位编号 0 起，截取位 <code>[124:61]</code>。例如 <code>x3 = 1</code>、<code>x2 = 0xA000000000000000</code> 时，结果为 <code>(1 &lt;&lt; 3) | 5 = 13</code>。<code>EXTR</code> 不改条件标志。</p>
+    <p><code>NZCV</code> 包含四个单比特条件标志。<code>N</code> 是负结果，<code>Z</code> 是零结果，<code>C</code> 是无符号进位，<code>V</code> 是有符号溢出。LLVM 在机器指令里用物理寄存器 <code>$nzcv</code> 建模。本例 <code>ADDSXrs</code> 有 <code>implicit-def $nzcv</code>，<code>ADCXr</code> 有 <code>implicit $nzcv</code>。<code>ADCSXr</code> 同时读入并更新标志。</p>
+    <p>调度器根据物理寄存器的定义和使用建立依赖边。<code>adds</code> 必须在读取其进位的 <code>adc</code> 前执行，另一条改写 <code>NZCV</code> 的指令也不能移到两者之间而覆盖待用进位。<code>extr</code> 不碰标志，原则上可以与 <code>adds</code> 交换，但必须在 <code>adc</code> 读取它产生的高半部之前。<a href="https://llvm.org/doxygen/ScheduleDAGInstrs_8cpp_source.html">LLVM 机器指令调度的物理寄存器依赖</a></p>
+    <p>选择后与最终汇编的截点显示，<code>ADCSXr</code> 与 <code>ADCXr</code> 的差异在 GlobalISel 指令选择之后消失。要找到具体改写的 pass，需要更细的日志边界。</p>
+  </section>
+
+  <section aria-labelledby="run">
+    <h2 id="run">复验 · 同一份 IR，两条路径</h2>
+    <p>从项目根目录运行，工具链用 LLVM 22.1.8。用 <code>case_name=wide</code> 替换第一行，可生成第二组对照。两组产物分别写进 Git 忽略的目录。</p>
+    <pre><code>case_name=narrow
+case "$case_name" in
+  narrow) input=experiments/add-shift.ll ;;
+  wide) input=experiments/add-shift-wide.ll ;;
+esac
+out="evidence/day3/$case_name"
+mkdir -p "$out"
+run_llc() {
+  "${LLC:-llc}" -mtriple=aarch64-unknown-linux-gnu -mcpu=generic -O2 \
+    -verify-machineinstrs "$@" "$input"
+}
+for stage in irtranslator legalizer regbankselect instruction-select; do
+  run_llc -global-isel -global-isel-abort=1 -stop-after="$stage" \
+    -o "$out/$stage.mir"
+done
+run_llc -stop-after=aarch64-isel -o "$out/selectiondag.mir"
+run_llc -debug-pass=Structure -o "$out/selectiondag.s" 2&gt; "$out/selectiondag-pipeline.txt"
+run_llc -global-isel -global-isel-abort=1 -debug-pass=Structure \
+  -o "$out/globalisel.s" 2&gt; "$out/globalisel-pipeline.txt"</code></pre>
+  </section>
+
+  <section aria-labelledby="exercise">
+    <h2 id="exercise">评审练习 · 给定输入与观察</h2>
+    <p>你在评审一条实验结论：「两份汇编都是 <code>add x0, x0, x1, lsl #3</code>，所以走了同一个选择器。」依据上面的 <code>add-shift.ll</code> 和复验记录，写一段可以直接贴进评审的回应。可直接从表中选证据，也可运行命令看完整 MIR。</p>
+    <form id="answers">
+      <div class="save-bar">
+        <span id="save-status" role="status">当前是只读预览。回到 VS Code 文件树打开此文件，或用 <strong>Reopen Editor With… → Learning Checkpoint</strong> 切换。也可<a href="http://127.0.0.1:8765/learning/checkpoints/P2-C1.html#exercise">打开可填写的本地服务页面</a>。</span>
+      </div>
+      <p>在 <strong>Learning Checkpoint</strong> 编辑器里直接填写，按 <kbd>Cmd+S</kbd> 保存到本页 HTML。若使用 <strong>Text Editor</strong>，搜索「作答区」，在对应的 <code>&lt;textarea&gt;</code> 标签之间写入并保存。</p>
+      <label for="representation">1. 表示 · 在哪里能看出两条路径的差别？</label>
+      <p>从给定的 <code>G_SHL</code>、<code>G_ADD</code> 和 <code>ADDXrs</code> 中选具体指令，说明两条路径的中间表示各自能在哪里观察。可以写两句对照。</p>
+      <!-- 作答区：表示 -->
+      <textarea readonly id="representation" name="representation" rows="4">
+在 irtranslator 中
+narrow：
+    %2:_(s64) = G_CONSTANT i64 3
+    %3:_(s64) = G_SHL %1, %2(s64)
+    %4:_(s64) = G_ADD %0, %3
+wide：
+    %6:_(s128) = G_CONSTANT i128 3
+    %7:_(s128) = G_SHL %1, %6(s128)
+    %8:_(s128) = G_ADD %0, %7
+这里的表示还基本一致</textarea>
+      <label for="boundary">2. 边界 · 怎样证明移位已折叠进加法？</label>
+      <p>从 GlobalISel 的多个截点里挑出最有区分力的前后两个，各引用一项观察。再说明 SelectionDAG 的哪个截点适合与后一个比较。</p>
+      <!-- 作答区：边界 -->
+      <textarea readonly id="boundary" name="boundary" rows="4">
+selectiondag 中：
+%2:gpr64 = ADDXrs %0, %1, 3
+已经折叠，可以看出对比</textarea>
+      <label for="legalization">3. 合法化 · 宽运算如何拆成两个半部？</label>
+      <p>用给定的宽 MIR 写两条关系：移位后的高半部怎样形成，低位加法的哪个结果被高位加法使用。各引用一个相关 opcode 或虚拟寄存器。</p>
+      <!-- 作答区：合法化 -->
+      <textarea readonly id="legalization" name="legalization" rows="4">
+低半部：
+1. b 低半部移位获得移位后的 b 低半部
+2. 移位后的 b 低半部与 a 低半部相加，产生和、进位
+高半部：
+1. 通过 extr 获得移位以后的b高半部
+2. 移位后的 b 高半部与 a 的高半部，以及低半部进位，相加</textarea>
+      <label for="late-change">4. 选择后差异 · 宽位对照对评审有什么影响？</label>
+      <p>给定上表的 <code>ADCSXr</code>、<code>ADCXr</code> 与最终 <code>adc</code>，说清在哪个截点两条路径仍不同。如果要确认具体哪个 pass 改了高位指令，你需要再拿到什么证据？本题可以只写取证方案。</p>
+      <!-- 作答区：选择后差异 -->
+      <textarea readonly id="late-change" name="late-change" rows="4">
+需要逐个 pass 输出 ir 结果，排查哪里修改了</textarea>
+      <label for="verdict">5. 总结 · 给评审一段结论</label>
+      <p>先写用于核对实际路径和排除回退的证据，再用 3–5 句概括两种位宽下的共同点、差异和适用范围。</p>
+      <!-- 作答区：结论 -->
+      <textarea readonly id="verdict" name="verdict" rows="4">
+
+</textarea>
+    </form>
+    <details id="review-feedback">
+      <summary>作答后讲解 · 用阶段证据写综合评审</summary>
+      <p><strong>先说明为什么最终汇编不足以判定路径。</strong>窄例的两份汇编都发出带移位的 <code>add</code>。GlobalISel 在 RegBankSelect 后仍有 <code>G_SHL</code> 与 <code>G_ADD</code>，InstructionSelect 后已是 <code>ADDXrs</code>。SelectionDAG 的对应证据是 <code>aarch64-isel</code> 后的 <code>ADDXrs</code>。由此可说两条路径在选择后已经对齐到同一指令形态。</p>
+      <p><strong>再确认实际运行的路径。</strong>GlobalISel 的 pass 日志包含 <code>IRTranslator</code>、<code>Legalizer</code>、<code>RegBankSelect</code> 和 <code>InstructionSelect</code>。完整运行加了 <code>-global-isel-abort=1</code>，退出成功，所以这次运行的结果没有经过选择失败后的回退。独立的 SelectionDAG 日志显示 <code>AArch64 Instruction Selection</code>。</p>
+      <p><strong>用宽例说明结论范围。</strong>两条路径最终都发出 <code>adc</code>，但 GlobalISel 选择后仍是 <code>ADCSXr</code>，SelectionDAG 已是 <code>ADCXr</code>。逐 pass 检查 GlobalISel 的机器指令输出，第一次变化发生在 <code>AArch64 Post Select Optimizer</code> 之后。<code>ADCXr</code> 仍读取 <code>NZCV</code> 的进位，少了更新标志的定义。</p>
+      <pre><code>mkdir -p evidence/day3/wide
+"${LLC:-llc}" -mtriple=aarch64-unknown-linux-gnu -mcpu=generic -O2 \
+  -verify-machineinstrs -global-isel -global-isel-abort=1 \
+  -print-after-all -filter-print-funcs=add_shift_wide \
+  experiments/add-shift-wide.ll -o /dev/null 2&gt; evidence/day3/wide/pass-mir.txt</code></pre>
+      <p>在日志中以 <code>IR Dump After</code> 为边界，找到 <code>ADCSXr</code> 首次变为 <code>ADCXr</code> 的位置。</p>
+      <p><strong>评审示例。</strong>这组实验的最终汇编相同，但运行日志显示走了两条选择路径，且 GlobalISel 的完整运行开启失败即中止并成功退出。窄例的两条路径在选择后均含 <code>ADDXrs</code>。宽例在选择后保留高位加法 opcode 的差异，GlobalISel 的后续优化让两边最终都发出 <code>adc</code>。结论限于这两份 IR 和固定的工具链及参数。</p>
+    </details>
+  </section>
+</main>
+<script src="../answers.js"></script>
+</body>
+</html>

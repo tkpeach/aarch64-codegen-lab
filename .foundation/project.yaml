@@ -1,0 +1,8 @@
+protocol_version: "0.1"
+event_store: .foundation/events.sqlite3
+capabilities: [work, checkpoint]
+profiles: [learning]
+verification:
+  kind: manual
+  description: Review the source, evidence, and limits against the topic's stated criteria.
+recording_policy: advisory

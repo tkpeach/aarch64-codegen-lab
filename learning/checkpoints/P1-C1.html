@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>第 1 天 · 从 LLVM IR 到 AArch64 指令</title>
+  <style>
+    :root { color-scheme: light dark; font: 17px/1.75 system-ui, sans-serif; }
+    body { margin: 0; }
+    main { max-width: 46rem; margin: auto; padding: 2rem 1.25rem 4rem; }
+    h1, h2, h3 { line-height: 1.3; }
+    section { margin-top: 2rem; }
+    pre { overflow: auto; padding: .75rem 1rem; background: color-mix(in srgb, CanvasText 7%, Canvas); border-radius: .4rem; }
+    code, pre { font-family: ui-monospace, monospace; }
+    label { display: block; margin: 1.2rem 0 .4rem; font-weight: 650; }
+    textarea { display: block; box-sizing: border-box; width: 100%; min-height: 6rem; padding: .6rem; font: inherit; font-family: ui-monospace, monospace; resize: vertical; }
+    .save-bar { position: sticky; top: 0; padding: .5rem 0; background: Canvas; }
+    button { margin-top: 1.2rem; padding: .5rem .85rem; font: inherit; cursor: pointer; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>从 LLVM IR 到 AArch64 指令</h1>
+  <p>第 1 天 · LLVM 22.1.8 · SelectionDAG · 约 60–75 分钟</p>
+  <p><a href="#lesson">读讲解</a>（15 分钟） · <a href="#compare">复验对照</a>（15–20 分钟） · <a href="#source">追源码并作答</a>（30–40 分钟）</p>
+
+  <section aria-labelledby="lesson">
+    <h2 id="lesson">同一个表达式在三个阶段的表示</h2>
+    <ol>
+      <li><strong>构图。</strong><code>SelectionDAGBuilder</code> 访问 IR 指令，把值与依赖转换成带类型的 DAG 节点和边。可以从返回值依赖的计算节点向下追踪操作数。</li>
+      <li><strong>整形。</strong><code>SelectionDAGISel</code> 驱动 DAG combine 和 legalization。Combine 重写图形状，legalization 处理目标不直接支持的类型和操作。读匹配规则时，要追踪选择器实际收到的图形状。</li>
+      <li><strong>选择。</strong>AArch64 selector 把可匹配的子图替换成目标机器节点。一个匹配可以覆盖多层节点。之后机器指令还会经过寄存器分配等 pass，最终由汇编输出展示。</li>
+    </ol>
+
+    <h3>用单独的减法走一遍</h3>
+    <pre><code>define i64 @diff(i64 %a, i64 %b) {
+  %d = sub i64 %a, %b
+  ret i64 %d
+}</code></pre>
+    <p>从源码可把整数减法追到接收两个 <code>i64</code> 值的 <code>ISD::SUB</code>。<code>llc -print-after=aarch64-isel</code> 的日志标题写着 <code>IR Dump</code>，正文展示的是指令选择后的机器基本块。这个阶段已经同时出现物理寄存器和虚拟寄存器，可以按参数、计算、返回的顺序追踪数据。</p>
+    <pre><code>bb.0 (%ir-block.0):
+  liveins: $x0, $x1
+  %1:gpr64 = COPY $x1
+  %0:gpr64 = COPY $x0
+  %2:gpr64 = SUBSXrr %0:gpr64, %1:gpr64, implicit-def dead $nzcv
+  $x0 = COPY %2:gpr64
+  RET_ReallyLR implicit $x0</code></pre>
+    <ol>
+      <li><strong>入口参数。</strong><code>liveins</code> 是 LLVM Machine IR 的通用标记，列出进入这个机器基本块时已有可用值的物理寄存器。在这个入口块，AArch64 调用约定把两个参数放在 <code>$x0</code> 和 <code>$x1</code>，两条 <code>COPY</code> 分别将它们引入虚拟寄存器 <code>%0</code> 和 <code>%1</code>。 调用约定在后端降低函数参数时就确定了物理入口寄存器，所以寄存器分配前也会看到 <code>$x0</code> 和 <code>$x1</code>。分配器随后为 <code>%0</code>、<code>%1</code> 等虚拟寄存器选择实际寄存器，并遵守已有的物理寄存器约束。若源和目标最终落在同一寄存器，入口的 <code>COPY</code> 可以消掉。<a href="https://llvm.org/docs/MIRLangRef.html">LLVM MIR 格式参考</a></li>
+      <li><strong>计算。</strong><code>SUBSXrr</code> 读取两个虚拟寄存器，写出 <code>%2</code>，并隐式定义 <code>$nzcv</code>。<code>dead</code> 表示标志位没有后续使用。最终汇编中的计算是 <code>sub x0, x0, x1</code>。</li>
+      <li><strong>返回。</strong><code>$x0 = COPY %2:gpr64</code> 把结果放进调用约定规定的返回值寄存器。AArch64 特有的伪指令 <code>RET_ReallyLR</code> 用 <code>implicit $x0</code> 表示返回时需要保留这个结果。最终的 <code>ret</code> 通过链接寄存器 <code>LR</code>（<code>x30</code>）取得返回地址。<a href="https://github.com/llvm/llvm-project/blob/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/Target/AArch64/AArch64InstrInfo.td#L3283-L3334">AArch64 返回指令定义</a></li>
+    </ol>
+    <p>下一组对照沿用这条数据流。把结果加宽到两个 64 位字后，第二条计算要读取 <code>$nzcv</code>，返回也要通过 <code>$x0</code> 和 <code>$x1</code> 交付两个分量。</p>
+    <p>沿固定提交阅读源码时，可先找 <code>AArch64PassConfig::addInstSelector</code>，再看共用 DAG 驱动和目标匹配规则。
+      <a href="https://github.com/llvm/llvm-project/blob/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/Target/AArch64/AArch64TargetMachine.cpp#L649">AArch64 后端接入点</a> ·
+      <a href="https://github.com/llvm/llvm-project/tree/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/CodeGen/SelectionDAG">SelectionDAG 源码</a> ·
+      <a href="https://github.com/llvm/llvm-project/tree/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/Target/AArch64">AArch64 selector 和 TableGen 定义</a></p>
+  </section>
+
+  <section aria-labelledby="compare">
+    <h2 id="compare">受控对照 · 只把减法加宽到 i128</h2>
+    <p>输入仍是一条减法 IR，计算值由 64 位变成 128 位。保持 triple、CPU、优化级别和 selector 配置相同。对照两次选择后的机器指令，再看最终汇编。</p>
+    <pre><code>define i128 @diff_wide(i128 %a, i128 %b) {
+  %d = sub i128 %a, %b
+  ret i128 %d
+}</code></pre>
+    <pre><code>%4:gpr64 = SUBSXrr %0:gpr64, %2:gpr64, implicit-def $nzcv
+%5:gpr64 = SBCXr %1:gpr64, %3:gpr64, implicit $nzcv</code></pre>
+    <p>把操作数写成高低两个 64 位字。低半部先计算差，若低半部借位，高半部的差还要减 1。选择后第一条指令定义 <code>$nzcv</code>，第二条隐式读取它。这条依赖在窄减法中没有后续使用，在宽减法中参与计算。最终汇编对应 <code>subs x0, x0, x2</code> 和 <code>sbc x1, x1, x3</code>。</p>
+    <p>手算一次 <code>0x1_0000000000000000 - 1</code>，把高低半部与两条机器指令对上。这个对照给出了一个边界反例：即使 IR 只有一条算术指令，目标计算仍可能需要多条指令。</p>
+    <details>
+      <summary>复验两组减法</summary>
+      <p>从项目根目录运行。默认从 PATH 使用 <code>llc</code>，也可通过环境变量 <code>LLC</code> 指定 LLVM 22.1.8 的可执行文件。先核对版本和已注册的 AArch64 目标。两个 IR 函数都已保存在仓库的 <a href="../../experiments/day1-sub.ll">experiments/day1-sub.ll</a>。汇编和指令选择日志写入 Git 忽略的 <code>evidence/day1/</code>。</p>
+      <pre><code>mkdir -p evidence/day1
+"${LLC:-llc}" --version
+"${LLC:-llc}" \
+  -mtriple=aarch64-unknown-linux-gnu -mcpu=generic -O2 \
+  -verify-machineinstrs -print-after=aarch64-isel \
+  experiments/day1-sub.ll -o evidence/day1/sub.s 2&gt; evidence/day1/sub-isel.txt</code></pre>
+    </details>
+  </section>
+
+  <section aria-labelledby="source">
+    <h2 id="source">沿源码追踪阶段边界</h2>
+    <p>以下片段来自 LLVM 22.1.8 的固定提交。先用已讲解的减法走通三个入口，再把同一套读法应用到练习。</p>
+
+    <h3>1. 构图 · 从 IR 操作数拿到 DAG 值</h3>
+    <p>这里的「DAG 值」是 <code>SDValue</code>，即对一个节点的某个输出的引用。它由生产该值的 <code>SDNode *</code> 和从零开始的结果编号 <code>ResNo</code> 组成。节点描述一次操作，操作数边引用生产节点的具体结果。<a href="https://github.com/llvm/llvm-project/blob/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/include/llvm/CodeGen/SelectionDAGNodes.h#L147">SDValue 定义</a></p>
+    <p>减法节点只产出一个 <code>i64</code> 结果，<code>%d</code> 对应它的结果 0。普通 load 可以同时产出读到的数据和用于约束内存操作顺序的 chain。同一个节点可因此产生两个不同的 <code>SDValue</code>。</p>
+    <pre><code>SDValue Op1 = getValue(I.getOperand(0));
+SDValue Op2 = getValue(I.getOperand(1));
+SDValue BinNodeValue = DAG.getNode(Opcode, getCurSDLoc(), Op1.getValueType(),
+                                   Op1, Op2, Flags);
+setValue(&amp;I, BinNodeValue);</code></pre>
+    <p><code>getValue</code> 查到两个操作数的 DAG 值，<code>getNode</code> 用传入的 opcode 和第一个操作数的类型创建结果，<code>setValue</code> 将结果关联回当前 IR 值。移位走旁边的 <code>visitShift</code>，从下面这行开始看目标如何决定移位量的类型。</p>
+    <pre><code>EVT ShiftTy = DAG.getTargetLoweringInfo().getShiftAmountTy(
+    Op1.getValueType(), DAG.getDataLayout());</code></pre>
+    <p><a href="https://github.com/llvm/llvm-project/blob/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/CodeGen/SelectionDAG/SelectionDAGBuilder.cpp#L3684-L3725">SelectionDAGBuilder.cpp · visitBinary 和 visitShift</a></p>
+
+    <h3>2. 合法化 · 确认 matcher 收到哪一版 DAG</h3>
+    <p>下面是 <code>CodeGenAndEmitDAG</code> 中按出现顺序摘出的调用。省略了条件分支、计时和其他处理。类型或向量合法化改变 DAG 后可以触发中间的 combine，选择前还会对操作合法化后的 DAG 做 combine。</p>
+    <pre><code>CurDAG-&gt;Combine(BeforeLegalizeTypes, getBatchAA(), OptLevel);
+Changed = CurDAG-&gt;LegalizeTypes();
+// … 类型合法化后的 combine 和向量合法化 …
+CurDAG-&gt;Legalize();
+CurDAG-&gt;Combine(AfterLegalizeDAG, getBatchAA(), OptLevel);
+// …
+DoInstructionSelection();</code></pre>
+    <p><a href="https://github.com/llvm/llvm-project/blob/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/CodeGen/SelectionDAG/SelectionDAGISel.cpp#L936-L1142">SelectionDAGISel.cpp · CodeGenAndEmitDAG</a></p>
+
+    <h3>3. 选择 · 从手写分支进入生成的 matcher</h3>
+    <pre><code>void AArch64DAGToDAGISel::Select(SDNode *Node) {
+  // … 检查已选择的节点，处理各 opcode 的手写分支 …
+  SelectCode(Node);
+}</code></pre>
+    <p>上面保留了函数入口和末尾的调用。手写分支处理完成时可以提前返回。执行到 <code>SelectCode(Node)</code> 时，由 TableGen 生成的 matcher 尝试匹配当前节点及其操作数。练习中可先用 DAG 根 opcode 和操作数形状缩小搜索范围，再用 <code>AArch64InstrInfo.td</code> 核对候选指令及其约束。</p>
+    <p><a href="https://github.com/llvm/llvm-project/blob/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/Target/AArch64/AArch64ISelDAGToDAG.cpp#L4784">手写 selector 入口</a> · <a href="https://github.com/llvm/llvm-project/blob/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/Target/AArch64/AArch64ISelDAGToDAG.cpp#L7433-L7435">SelectCode 调用</a> · <a href="https://github.com/llvm/llvm-project/blob/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/Target/AArch64/AArch64InstrInfo.td">AArch64InstrInfo.td</a></p>
+    <h4>构建时 · TableGen 从哪里拿规则</h4>
+    <pre><code>set(LLVM_TARGET_DEFINITIONS AArch64.td)
+# … 省略其他生成规则 …
+tablegen(LLVM AArch64GenDAGISel.inc -gen-dag-isel)</code></pre>
+    <p><code>AArch64.td</code> 引入 <code>AArch64InstrInfo.td</code> 等定义。构建 LLVM 时，CMake 用 <code>llvm-tblgen -gen-dag-isel</code> 把这些记录中的 DAG 匹配模式生成到构建树下的 <code>lib/Target/AArch64/AArch64GenDAGISel.inc</code>。上游源码里可以找到生成规则和输入，带构建目录时才有这一轮输出的 <code>.inc</code>。<a href="https://github.com/llvm/llvm-project/blob/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/Target/AArch64/CMakeLists.txt#L3-L9">CMake 规则</a> · <a href="https://github.com/llvm/llvm-project/blob/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/Target/AArch64/AArch64.td#L37">TableGen 输入</a></p>
+
+    <h4>运行时 · 谁执行匹配</h4>
+    <p><code>AArch64ISelDAGToDAG.cpp</code> 通过 <code>#include "AArch64GenDAGISel.inc"</code> 编入生成代码。<code>DAGISelEmitter.cpp</code> 注册 <code>gen-dag-isel</code>，<code>DAGISelMatcherEmitter.cpp</code> 写出 <code>SelectCode</code> 和 <code>MatcherTable</code>。下面是生成函数的结构，表项已省略。<a href="https://github.com/llvm/llvm-project/blob/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/Target/AArch64/AArch64ISelDAGToDAG.cpp#L450">包含位置</a> · <a href="https://github.com/llvm/llvm-project/blob/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/utils/TableGen/DAGISelMatcherEmitter.cpp#L1389-L1419">生成器</a></p>
+    <pre><code>void SelectCode(SDNode *N) {
+  static const uint8_t MatcherTable[] = {
+    // … 编码后的匹配步骤 …
+  };
+  SelectCodeCommon(N, MatcherTable, sizeof(MatcherTable));
+}</code></pre>
+    <p>运行 <code>llc</code> 时，共用的 <code>SelectCodeCommon</code> 解释已经编入二进制的匹配表，按表中的步骤检查 DAG 节点并构造或替换成目标机器节点。读规则从 <code>.td</code> 入手，读生成格式看 emitter，读表项如何执行则看 <code>SelectionDAGISel.cpp</code>。<a href="https://github.com/llvm/llvm-project/blob/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/CodeGen/SelectionDAG/SelectionDAGISel.cpp">匹配表解释器</a></p>
+    <h4 id="tablegen-example">减法规则如何变成匹配表</h4>
+    <p>前面实测的 <code>SUBSXrr</code> 可以追到 AArch64 的这条独立 <code>Pat</code>。左边描述要匹配的 DAG 形状，右边描述要构造的机器节点。<code>$Rn</code> 和 <code>$Rm</code> 把输入绑定到输出指令的对应操作数。<a href="https://github.com/llvm/llvm-project/blob/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/Target/AArch64/AArch64InstrInfo.td#L2739-L2740">AArch64 的减法规则</a></p>
+    <pre><code>def : Pat&lt;(sub GPR64:$Rn, GPR64:$Rm),
+          (SUBSXrr GPR64:$Rn, GPR64:$Rm)&gt;;</code></pre>
+    <p>右边的 <code>SUBSXrr</code> 来自 <code>defm SUBS : AddSubS&lt;…&gt;</code> 展开的 <code>Xrr</code>。<code>Defs = [NZCV]</code> 属于指令定义，对应机器指令日志里的隐式定义。生成器把 pattern 转成检查、记录操作数和输出机器节点等 matcher 步骤，再对所有规则一起优化并写表。<a href="https://github.com/llvm/llvm-project/blob/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/Target/AArch64/AArch64InstrFormats.td#L3176-L3191">AddSubS 定义</a> · <a href="https://github.com/llvm/llvm-project/blob/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/utils/TableGen/DAGISelEmitter.cpp#L165-L198">matcher 生成过程</a></p>
+    <p>用仓库里的 <a href="../../experiments/sub-matcher.td">sub-matcher.td</a> 隔离一条形状相同的规则，把输出 opcode 简化为 <code>SUBrr</code>。以下表项由 LLVM 22.1.8 的 <code>llvm-tblgen</code> 实际生成，省略了源模式和目标模式的注释。这张表只包含教学目标的一条规则。完整 AArch64 表会和其他模式一起优化，可能共用 opcode 分派和检查。</p>
+    <pre><code>/*      0*/ OPC_CheckOpcode, TARGET_VAL(ISD::SUB),
+/*      3*/ OPC_RecordChild0, // #0 = $lhs
+/*      4*/ OPC_RecordChild1, // #1 = $rhs
+/*      5*/ OPC_MorphNodeTo1None, TARGET_VAL(::SUBrr),
+                 MVT::i64, 2/*#Ops*/, 0, 1,
+    0</code></pre>
+    <ol>
+      <li><code>OPC_CheckOpcode</code> 检查当前 DAG 根是否是 <code>ISD::SUB</code>。<code>TARGET_VAL</code> 将 opcode 编入表项。</li>
+      <li><code>OPC_RecordChild0</code> 和 <code>OPC_RecordChild1</code> 把两个输入 <code>SDValue</code> 存入临时记录的槽位 <code>0</code>、<code>1</code>。它们对应规则里的 <code>$lhs</code>、<code>$rhs</code>。</li>
+      <li><code>OPC_MorphNodeTo1None</code> 读取目标 opcode、一个 <code>i64</code> 结果和两个操作数槽位，把当前 DAG 根改写成 <code>SUBrr</code> 机器节点。这里的 <code>None</code> 表示这个表项没有 chain 或 glue 标志。</li>
+    </ol>
+    <p><code>SelectCodeCommon</code> 按上述顺序读表，记录的操作数直接供机器节点使用。在完整匹配表中，检查失败时可退回到还有备选的匹配作用域，继续试下一条候选。<a href="https://github.com/llvm/llvm-project/blob/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/CodeGen/SelectionDAG/SelectionDAGISel.cpp#L3297">SelectCodeCommon</a></p>
+    <details>
+      <summary>亲自从 .td 生成 .inc</summary>
+      <p>从仓库根目录运行。让 <code>llvm-config</code> 和 <code>llvm-tblgen</code> 来自同一套 LLVM 22.1.8，并确认 LLVM 安装提供 <code>llvm/Target/Target.td</code>。</p>
+      <pre><code>mkdir -p evidence/day1
+llvm_include=$("${LLVM_CONFIG:-llvm-config}" --includedir)
+"${LLVM_TBLGEN:-llvm-tblgen}" -I "$llvm_include" \
+  -I "$llvm_include/llvm/Target" -gen-dag-isel \
+  experiments/sub-matcher.td -o evidence/day1/SubMatcher.inc</code></pre>
+      <p>打开生成文件并搜索 <code>MatcherTable</code>，随后看 <code>SelectCodeCommon</code> 调用如何把表交给解释器。</p>
+    </details>
+    <p><code>-print-after=aarch64-isel</code> 能看到已经选择的机器指令。源代码里的建图和匹配证据用来解释其来历。记录结论时分别写「源码推导」和「这次运行观察」，便于判断哪一步还需验证。</p>
+  </section>
+
+  <section aria-labelledby="source-review">
+    <h2 id="source-review">作答后复盘 · 怎样选源码细节、怎样找</h2>
+    <p>前三题围绕同一个判断：移位和加法在哪个阶段合成一条机器指令，为什么这次能合成？源码符号用于定位证据，可以查阅。先用自己的话说清因果，再附上具体出处。</p>
+    <ol>
+      <li><strong>先确认匹配器要看到的结构。</strong>构图题要说明加法的第二个操作数来自移位结果，这条边直接影响能否匹配。查构图时，先在 <code>SelectionDAGBuilder.cpp</code> 搜 <code>visitShift</code> 和 <code>visitBinary</code>，看每处怎样取操作数和建立结果。移位量类型仅在它影响你的判断时展开。<a href="https://github.com/llvm/llvm-project/blob/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/CodeGen/SelectionDAG/SelectionDAGBuilder.cpp#L3684-L3720">构图源码</a></li>
+      <li><strong>再找让结果分叉的条件。</strong>复盘时从选择后的 opcode <code>ADDXrs</code> 倒查。先在 <code>AArch64InstrInfo.td</code> 搜 <code>defm ADD</code>，再到 <code>AArch64InstrFormats.td</code> 的 <code>AddSub</code> 中找 <code>Xrs</code>。<code>defm</code> 会拼接名字，因此直接搜完整 opcode 可能找不到定义。顺着 <code>arith_shifted_reg64</code> 找 <code>ComplexPattern</code> 的回调名 <code>SelectArithShiftedRegister</code>，再跟到 <code>SelectShiftedRegister</code>。在普通移位分支里，常量检查决定能否编码，<code>isWorthFoldingALU</code> 决定是否值得折叠。本例移位只有一个使用点，满足其中的单次使用条件。<a href="https://github.com/llvm/llvm-project/blob/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/Target/AArch64/AArch64InstrInfo.td#L2708">ADD 入口</a> · <a href="https://github.com/llvm/llvm-project/blob/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/Target/AArch64/AArch64InstrFormats.td#L1254-L1263">回调声明</a> · <a href="https://github.com/llvm/llvm-project/blob/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/Target/AArch64/AArch64ISelDAGToDAG.cpp#L871-L915">条件实现</a></li>
+      <li><strong>最后验证结论发生在哪个阶段。</strong>验证题关心你选的观察点能否回答问题。选择后日志已经出现一条 <code>ADDXrs</code>，就能说明这次折叠在选择结束时已经发生。若同一位置看到独立的移位和普通加法，则应修正这个判断。最终汇编用于复核输出。</li>
+    </ol>
+    <p>可用一句话自查：「我选的这段代码能解释输入形状、区分匹配成功与失败，或证明变化在哪个阶段发生吗？」若都不能，先跳过这段实现。复核时可以边查边写，函数名以能定位你的依据为准。</p>
+  </section>
+
+  <section aria-labelledby="exercise">
+    <h2 id="exercise">P1-C1 · 独立解释</h2>
+    <p><strong>总问题。</strong>对这份移位加法 IR，AArch64 后端会怎样选择计算指令，什么条件会改变选择，又如何用阶段输出核对？最终请能把四个小问串成一段机制解释。</p>
+    <ol>
+      <li>第 1 题交代选择器收到的输入关系。查构图函数如何取操作数和建立结果。</li>
+      <li>第 2 题解释为什么某个指令形态可以匹配。查目标指令定义和匹配条件。</li>
+      <li>第 3 题说明观察什么才能定位变化阶段。区分选择后日志与最终汇编。</li>
+      <li>第 4 题用一个合法、只改变目标条件的输入来检验解释。</li>
+    </ol>
+    <p>可以边查边答。减法热身用来练习读机器指令和状态依赖。</p>
+    <form id="answers">
+      <div class="save-bar">
+        <span id="save-status" role="status">当前是只读预览。<a href="http://127.0.0.1:8765/learning/checkpoints/P1-C1.html#exercise">打开可填写的答题页</a>。若连接失败，在项目根目录运行 <code>python3 learning/serve.py</code> 后重试。</span>
+      </div>
+      <p>用 VS Code 的 Text Editor 打开本 HTML 源文件，搜索「作答区」，在对应的 <code>&lt;textarea&gt;</code> 和 <code>&lt;/textarea&gt;</code> 之间直接写，按普通文件保存。也可通过本地服务在浏览器中填写。</p>
+      <p>直接写你的思路，可以用要点、代码或简短说明。可分次完成，输入后自动写入。显示「已写入原 HTML」即可请 Agent 评阅。</p>
+      <h3>热身 · i128 减法（diff_wide）</h3>
+      <p>本题沿用前面的宽减法，只计算 <code>a − b</code>。</p>
+      <label for="borrow">减法复盘（给定数值）。把 a = 0x1_0000000000000000、b = 1 代入 diff_wide，写出 a − b 的低 64 位、高 64 位，以及借位如何传到高半部。</label>
+      <p id="borrow-format">用十六进制填写两个 64 位字，再用一句话说明低半部有没有借位、<code>subs</code> 写入的哪个状态位被 <code>sbc</code> 读取。例子换成 <code>0x2_0000000000000003 − 1</code> 时，可以写「低 64 位 = <code>0x0000000000000002</code>，高 64 位 = <code>0x0000000000000002</code>。低半部无需借位，<code>subs</code> 设置 <code>NZCV.C = 1</code>，<code>sbc</code> 读取 C，高半部无需额外减 1。」</p>
+      <!-- 作答区：减法热身。在下方 textarea 标签之间填写。 -->
+      <textarea readonly id="borrow" name="borrow" rows="4" aria-describedby="borrow-format">
+
+</textarea>
+      <h3>主练习 · 移位加法（add_shift）</h3>
+    <p>第 1–3 题统一使用下方完整的 <code>add_shift</code> IR。把 <code>%a</code> 和 <code>%b</code> 当作任意 <code>i64</code> 参数，移位量固定为 <code>3</code>。运行条件为 LLVM 22.1.8、<code>aarch64-unknown-linux-gnu</code>、<code>generic</code> 和 <code>-O2</code>。先按源码推导，作答后再核对运行结果。</p>
+    <pre><code>define i64 @add_shift(i64 %a, i64 %b) {
+entry:
+  %shifted = shl i64 %b, 3
+  %sum = add i64 %a, %shifted
+  ret i64 %sum
+}</code></pre>
+      <label id="prompt-dag" for="dag">1. 两条 IR 指令进入 DAG 后，分别是什么节点？请写出值类型、操作数关系和相关构图入口。</label>
+      <p id="dag-format">这里用符号描述 DAG，不必给参数代入数字。可以每个节点写一行。以讲解中的窄减法为例，可写 <code>n0 = ISD::SUB i64(a, b)</code>，再写「IR 结果 <code>%d</code> 对应 <code>n0</code> 的第 0 个结果，构图入口是 <code>SelectionDAGBuilder::visitBinary</code>」。练习里如果一个节点引用另一个节点的输出，用自取的节点名标出这条边即可。</p>
+      <!-- 作答区：第 1 题 · DAG 节点。在下方 textarea 标签之间填写。 -->
+      <textarea readonly id="dag" name="dag" rows="4" aria-describedby="dag-format">
+1. 节点 ISD::SHL, 值类型 i64，构图入口是 SelectionDAGBuilder::visitBinary
+2. 节点 ISD::ADD, 值类型 i64，构图入口是 SelectionDAGBuilder::visitBinary</textarea>
+      <label id="prompt-match" for="match">2. 哪个阶段依据什么条件决定用一条还是多条目标计算指令？请给出相关源码符号和你推导的指令形态。</label>
+      <!-- 作答区：第 2 题 · 匹配条件。在下方 textarea 标签之间填写。 -->
+      <textarea readonly id="match" name="match" rows="4">
+指令选择决定用一条还是多条目标计算指令</textarea>
+      <label id="prompt-evidence" for="evidence">3. 推导里哪一步仍需要实测？你会看哪个阶段的输出，什么现象会让你修正判断？</label>
+      <!-- 作答区：第 3 题 · 验证方法。在下方 textarea 标签之间填写。 -->
+      <textarea readonly id="evidence" name="evidence" rows="4">
+%sum = add i64 %a, %shifted
+需要实测 i64 在 target 上面是否使用一条命令单独完成</textarea>
+      <label for="boundary">4. 自行构造输入（对照设计）。以给定的 add_shift IR 为起点，自己改动一处 IR，用来检验第 2 题提出的匹配条件。</label>
+      <p id="boundary-format">写出改后的 IR 行，说明改动检验的是哪项条件。其余 IR 和运行参数沿用第 1–3 题。本题只要求设计输入。</p>
+      <!-- 作答区：第 4 题 · IR 变体。在下方 textarea 标签之间填写。 -->
+      <textarea readonly id="boundary" name="boundary" rows="4" aria-describedby="boundary-format">
+define i128 @add_shift(i128 %a, i128 %b) {
+entry:
+  %shifted = shl i128 %b, 3
+  %sum = add i128 %a, %shifted
+  ret i128 %sum
+}</textarea>
+    </form>
+  </section>
+</main>
+<script src="../answers.js"></script>
+</body>
+</html>
