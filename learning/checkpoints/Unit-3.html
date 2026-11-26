@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>专题 3 · 从陌生算式定位首次改写并交接</title>
+  <style>
+    :root { color-scheme: light dark; font: 17px/1.75 system-ui, sans-serif; }
+    body { margin: 0; }
+    main { max-width: 46rem; margin: auto; padding: 2rem 1.25rem 4rem; }
+    h1, h2, h3 { line-height: 1.3; }
+    section { margin-top: 2rem; }
+    pre { overflow: auto; padding: .75rem 1rem; background: color-mix(in srgb, CanvasText 7%, Canvas); border-radius: .4rem; }
+    code, pre { font-family: ui-monospace, monospace; }
+    label { display: block; margin: 1.2rem 0 .4rem; font-weight: 650; }
+    textarea { display: block; box-sizing: border-box; width: 100%; min-height: 6rem; padding: .6rem; font: inherit; font-family: ui-monospace, monospace; resize: vertical; }
+    .save-bar { position: sticky; top: 0; padding: .5rem 0; background: Canvas; }
+    button { margin-top: 1.2rem; padding: .5rem .85rem; font: inherit; cursor: pointer; }
+  </style>
+</head>
+<body>
+<main>
+<h1>从陌生算式定位首次改写并交接</h1>
+<p>专题 3 · 原第 6–7 天，约 2 小时 · LLVM 22.1.8</p><p><strong>看到最终汇编中的复合运算，怎样证实它在哪一遍出现，并让另一位工程师复验这一判断？</strong></p><p>综合产出为一份带有初始预测、相邻 pass 证据、边界反例及续接入口的技术短报告。</p><nav><ol><li><a href="#chapter-1">先练习一次有答案的阶段定位</a></li><li><a href="#chapter-2">用消费者检验一个新假设</a></li><li><a href="#chapter-3">把盲预测和核对留在同一份报告</a></li><li><a href="#chapter-4">给接手者一份可以从头执行的记录</a></li><li><a href="#exercise">综合作答</a></li></ol></nav>
+<section id="chapter-1"><h2>先练习一次有答案的阶段定位</h2>
+<p>以宽加法为校准。低半部的加法产生进位 C，高半部读取 C。高半部结果返回后，它产生的新进位已经无人读取。如果把这两个方向混在一起，就会误以为省去标志写入也省去了进位输入。</p><p>完整输入 · <a href="../../experiments/add-shift-wide.ll">add-shift-wide.ll</a></p><pre><code>define i128 @add_shift_wide(i128 %a, i128 %b) {
+entry:
+  %shifted = shl i128 %b, 3
+  %sum = add i128 %a, %shifted
+  ret i128 %sum
+}</code></pre><pre><code>AArch64 Post Select Optimizer 前
+%17 = ADCSXr %3, %30, implicit-def $nzcv, implicit $nzcv
+同一 pass 后
+%17 = ADCXr  %3, %30,                     implicit $nzcv</code></pre><p>两行定义同一个结果，显式输入也相同。按 implicit 与 implicit-def 分开标记读取和写入，再问哪个变化能解释最终的 adc。这个前后对照支持将该函数的改写归到一遍；只有“选择后”和“最终”两张快照时，结论只能定位到两者之间。</p><p>从仓库根目录运行，先把 LLVM 22.1.8 的 llc 加入 PATH，或设置 LLC 指向它。</p><pre><code>mkdir -p evidence/unit3
+&quot;${LLC:-llc}&quot; -mtriple=aarch64-unknown-linux-gnu -mcpu=generic -O2 -verify-machineinstrs -global-isel -global-isel-abort=1 -print-before=aarch64-post-select-optimize -print-after=aarch64-post-select-optimize experiments/add-shift-wide.ll -o evidence/unit3/wide.s 2&gt; evidence/unit3/pair.txt</code></pre>
+</section>
+<section id="chapter-2"><h2>用消费者检验一个新假设</h2>
+<p>完整输入 · <a href="../../experiments/day6-multiply.ll">day6-multiply.ll</a></p><pre><code>define i64 @product_sum(i64 %x, i64 %y, i64 %a) {
+  %p = mul i64 %x, %y
+  %r = add i64 %p, %a
+  ret i64 %r
+}
+
+define i64 @product_xor(i64 %x, i64 %y, i64 %a) {
+  %p = mul i64 %x, %y
+  %r = xor i64 %p, %a
+  ret i64 %r
+}</code></pre><p>两个函数共享 %p = mul i64 %x, %y，更改的是 %p 的唯一消费者。乘法只保留低 64 位。试用 x=3、y=5、a=1 手算两个返回值，在图上标出哪一步使用第三个输入。你要检验的是消费者与乘积能否在目标运算中共同表达，以及这种形态最早在哪个截点可见。</p><p>从 <a href="https://github.com/llvm/llvm-project/blob/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/Target/AArch64/AArch64InstrInfo.td">AArch64InstrInfo.td</a> 的乘法指令或别名追到它的全部输入，读出每个源寄存器的作用。再到 <a href="https://github.com/llvm/llvm-project/blob/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/Target/AArch64/AArch64InstrInfo.cpp">AArch64InstrInfo.cpp</a> 反查相应机器 opcode 的使用处。记录一个可能发生改写的位置，随后以运行日志检验。若某个操作数是零寄存器，先将零代回算式，再判断第三个 IR 参数是否已经参与运算。</p>
+</section>
+<section id="chapter-3"><h2>把盲预测和核对留在同一份报告</h2>
+<p>先填下方第 1、2 栏并保存；再执行这里的命令。按函数名分别抄下选择后的定义、使用者与最终形态。若两端不同，在逐 pass 日志里先搜目标 opcode，再核对同一条指令的操作数是否满足你的判据。记录最早成立的 dump 和它的前一份；若选择时已经成立，报告对应的可观测边界。</p><p>从仓库根目录运行，先把 LLVM 22.1.8 的 llc 加入 PATH，或设置 LLC 指向它。</p><pre><code>bash experiments/replay-selection.sh 6
+&quot;${LLC:-llc}&quot; -mtriple=aarch64-unknown-linux-gnu -mcpu=generic -O2 -verify-machineinstrs -global-isel=0 -fast-isel=0 -filter-print-funcs=product_sum -print-after-all experiments/day6-multiply.ll -o /dev/null 2&gt; evidence/day6/stages.txt</code></pre><p>比较时以真实数据依赖对齐。虚拟寄存器号可能被重编号，寄存器分配后还会变为物理寄存器。只搜助记符，或仅比较文本行数，都会把同名但操作数不同的计算混在一起。</p>
+</section>
+<section id="chapter-4"><h2>给接手者一份可以从头执行的记录</h2>
+<p>短报告可按“结论及适用条件 → 输入和只改的一项 → 两个相邻截点 → 对照函数 → 仍待确认”写。已测宽例可以这样开头：“在 LLVM 22.1.8 的 generic AArch64 GlobalISel 下，高半部在 post-select-optimize 后保留对 NZCV 的读取，去掉对 NZCV 的写入。”接着给出本页首个命令和前后两行，接手者便能检查这句话的范围。</p><p>复验时从项目根目录读取 notes/README.md 和 Work 上下文。项目已有事件库时只运行 context；新工作副本先导入 .foundation/events.jsonl。上一次空库恢复后，上下文与原项目一致。工程验证在 Work，原答和反馈在检查点 Markdown；报告分别写出两处下一步。</p><pre><code>.venv/bin/repofoundry events import .foundation/events.jsonl --project .
+.venv/bin/repofoundry context --project .</code></pre>
+</section>
+<section id="exercise"><h2>综合作答</h2><form id="answers">
+<p id="save-status" role="status">使用 VS Code 的 Learning Checkpoint 编辑器或本地课程服务填写并保存。</p>
+<label for="unit3-q1">1. 先校准你认定“发生变化”的判据。</label>
+<p>用宽例两行逐项标记定义、使用和已无使用者的输出，说明哪条日志能把改写定位到单一 pass。</p>
+<!-- 作答区 -->
+<textarea id="unit3-q1" name="unit3-q1" rows="6" readonly>
+
+</textarea>
+<label for="unit3-q2">2. 在查看乘法日志前记录预测。</label>
+<p>以给定的 product_sum、product_xor 为输入，写出两个数据依赖图、所查源码位置、选择后与最终形态的预测。为两种可能的改写时机写下可区分它们的观察。</p>
+<!-- 作答区 -->
+<textarea id="unit3-q2" name="unit3-q2" rows="6" readonly>
+
+</textarea>
+<label for="unit3-q3">3. 复验后完成可交接的短报告。</label>
+<p>保留第 2 栏初稿。在此写运行条件、实际前后截点及操作数、对照函数、需要修订的推断，再附 Work 和待答记录的位置。注明一个当前证据仍不能回答的问题。</p>
+<!-- 作答区 -->
+<textarea id="unit3-q3" name="unit3-q3" rows="6" readonly>
+
+</textarea>
+</form></section>
+<nav><a href="Unit-1.html">专题 1</a> · <a href="Unit-2.html">专题 2</a></nav>
+</main>
+<script src="../answers.js"></script>
+</body></html>

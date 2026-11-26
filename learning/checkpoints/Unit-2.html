@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>专题 2 · 一个加数可以怎样编码</title>
+  <style>
+    :root { color-scheme: light dark; font: 17px/1.75 system-ui, sans-serif; }
+    body { margin: 0; }
+    main { max-width: 46rem; margin: auto; padding: 2rem 1.25rem 4rem; }
+    h1, h2, h3 { line-height: 1.3; }
+    section { margin-top: 2rem; }
+    pre { overflow: auto; padding: .75rem 1rem; background: color-mix(in srgb, CanvasText 7%, Canvas); border-radius: .4rem; }
+    code, pre { font-family: ui-monospace, monospace; }
+    label { display: block; margin: 1.2rem 0 .4rem; font-weight: 650; }
+    textarea { display: block; box-sizing: border-box; width: 100%; min-height: 6rem; padding: .6rem; font: inherit; font-family: ui-monospace, monospace; resize: vertical; }
+    .save-bar { position: sticky; top: 0; padding: .5rem 0; background: Canvas; }
+    button { margin-top: 1.2rem; padding: .5rem .85rem; font: inherit; cursor: pointer; }
+  </style>
+</head>
+<body>
+<main>
+<h1>一个加数可以怎样编码</h1>
+<p>专题 2 · 原第 4–5 天，约 90–120 分钟 · LLVM 22.1.8</p><p><strong>如何用少量输入，把寄存器移位、立即数编码、位宽和常量准备这几件事区分开？</strong></p><p>综合产出为一张覆盖 W/X 两种位宽的边界表，附上两个相互独立的反例和复验方法。</p><nav><ol><li><a href="#chapter-1">先确定被移位的对象</a></li><li><a href="#chapter-2">把“能编码”写成可执行的判断</a></li><li><a href="#chapter-3">加一个位宽对照，拆开两个假设</a></li><li><a href="#chapter-4">用两组新常量审查规则</a></li><li><a href="#exercise">综合作答</a></li></ol></nav>
+<section id="chapter-1"><h2>先确定被移位的对象</h2>
+<p>从上一专题的 add x0, x0, x1, lsl #3 出发。如果 x1=5，第二个加数是 40；如果 x1=6，则变成 48。另一个拼写 add x0, x0, #1, lsl #12 的第二个加数永远是 4096。前者用寄存器值和变换描述一个操作数，后者用两个字段共同表示常量。检查机器指令时先给每个操作数标出来源。</p><p>完整输入 · <a href="../../experiments/day4-add-imm.ll">day4-add-imm.ll</a></p><pre><code>define i64 @plus_4095(i64 %x) {
+  %sum = add i64 %x, 4095
+  ret i64 %sum
+}
+
+define i64 @plus_4096(i64 %x) {
+  %sum = add i64 %x, 4096
+  ret i64 %sum
+}
+
+define i64 @plus_4097(i64 %x) {
+  %sum = add i64 %x, 4097
+  ret i64 %sum
+}</code></pre><pre><code>K       选择后的数据流                         最终计算
+4095    ADDXri x, 4095, 0                    add x0, x0, #4095
+4096    ADDXri x, 1, 12                      add x0, x0, #1, lsl #12
+4097    MOVi32imm → SUBREG_TO_REG → ADDXrr    mov w8, #4097；add x0, x0, x8</code></pre><p>4097 在 32 位寄存器中准备。AArch64 写 W 寄存器会清零同一 X 寄存器的高 32 位，这使 x8 含有完整的正整数 4097。选择后的 SUBREG_TO_REG 表达寄存器值的关系，汇编里无需为这一关系另发一条拷贝。</p>
+</section>
+<section id="chapter-2"><h2>把“能编码”写成可执行的判断</h2>
+<p>这里讨论非负 K 由一条 ADD-immediate 直接表示的条件。尝试 s=0 和 s=12。每次先问 K 是否可以被 2 的 s 次方整除，再算 u=K/2^s 并要求 u≤4095。两个候选至少有一个成功即可。即使没有成功，也还需要运行选择器，才能知道它怎样构造等价的序列。</p><pre><code>K = 4096 = 0x1000
+s=0  → u=4096，超出 12 位
+s=12 → u=1，可精确还原 K
+K = 4097 = 0x1001
+s=0  → u=4097，超出 12 位
+s=12 → 除以 4096 有余数</code></pre><p>源码阅读：从 <a href="https://github.com/llvm/llvm-project/blob/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/Target/AArch64/AArch64InstrInfo.td">AArch64InstrInfo.td</a> 搜索 defm ADD，在 <a href="https://github.com/llvm/llvm-project/blob/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/Target/AArch64/AArch64InstrFormats.td">AArch64InstrFormats.td</a> 中沿 AddSub 比较 Wri、Xri 与 Xrs。找出哪些差异由寄存器类别表达，哪些属于立即数或移位操作数。用 4096 的日志核对 u、s 在目标指令里的顺序。</p>
+</section>
+<section id="chapter-3"><h2>加一个位宽对照，拆开两个假设</h2>
+<p>完整输入 · <a href="../../experiments/imm-width.ll">imm-width.ll</a></p><pre><code>define i32 @small_word(i32 %x) {
+  %r = add i32 %x, 4096
+  ret i32 %r
+}
+
+define i32 @neighbor_word(i32 %x) {
+  %r = add i32 %x, 4097
+  ret i32 %r
+}</code></pre><p>在同一 triple、CPU 和优化级别下，将 4096 和 4097 分别与前面的 i64 函数配对。本机选择后可见 ADDWri %0, 1, 12；另一例先用 MOVi32imm 产生常量，再由 ADDWrr 消费。结合 X 形式，寄存器类别随运算位宽改变，而这两个值落在哪一侧仍由同一立即数字段约束决定。</p><p>从仓库根目录运行，先把 LLVM 22.1.8 的 llc 加入 PATH，或设置 LLC 指向它。</p><pre><code>bash experiments/replay-selection.sh 4
+mkdir -p evidence/unit2
+&quot;${LLC:-llc}&quot; -mtriple=aarch64-unknown-linux-gnu -mcpu=generic -O2 -verify-machineinstrs -global-isel=0 -fast-isel=0 -print-after=aarch64-isel experiments/imm-width.ll -o evidence/unit2/dag.s 2&gt; evidence/unit2/isel.txt</code></pre>
+</section>
+<section id="chapter-4"><h2>用两组新常量审查规则</h2>
+<p>完整输入 · <a href="../../experiments/day5-add-imm.ll">day5-add-imm.ll</a></p><pre><code>define i64 @plus_8192(i64 %x) {
+  %sum = add i64 %x, 8192
+  ret i64 %sum
+}
+
+define i64 @plus_8193(i64 %x) {
+  %sum = add i64 %x, 8193
+  ret i64 %sum
+}
+
+define i64 @plus_16773120(i64 %x) {
+  %sum = add i64 %x, 16773120
+  ret i64 %sum
+}
+
+define i64 @plus_16777216(i64 %x) {
+  %sum = add i64 %x, 16777216
+  ret i64 %sum
+}</code></pre><p>先把四个十进制常量改写成十六进制，按同一规则逐个试两个 s。第一对相差 1，第二对相差一个 4096。解释为什么选取这样的距离，哪一对可以单独检验字段容量。保存预测后用 bash experiments/replay-selection.sh 5 核对。</p>
+</section>
+<section id="exercise"><h2>综合作答</h2><form id="answers">
+<p id="save-status" role="status">使用 VS Code 的 Learning Checkpoint 编辑器或本地课程服务填写并保存。</p>
+<label for="unit2-q1">1. 为两种 lsl 拼写标出加数来源。</label>
+<p>以 4096 和寄存器移位基线为证，填“输入 → 选择后 opcode 与操作数 → 运行时数值”。给出能改变其中一个加数的寄存器赋值。</p>
+<!-- 作答区 -->
+<textarea id="unit2-q1" name="unit2-q1" rows="6" readonly>
+
+</textarea>
+<label for="unit2-q2">2. 位宽改变了哪一步？</label>
+<p>用 4096、4097 × i32、i64 做四行表，注明字段、数据来源与最终使用者，再选一行用 TableGen 操作数定义解释。</p>
+<!-- 作答区 -->
+<textarea id="unit2-q2" name="unit2-q2" rows="6" readonly>
+
+</textarea>
+<label for="unit2-q3">3. 提交四个新常量的边界预测和反例。</label>
+<p>按 K｜可行的 u、s 或排除理由｜替代形态预测填写。分别给出能否定“只看对齐”和“只看数值范围”的输入，注明复验截点。</p>
+<!-- 作答区 -->
+<textarea id="unit2-q3" name="unit2-q3" rows="6" readonly>
+
+</textarea>
+</form></section>
+<nav><a href="Unit-1.html">专题 1</a> · <a href="Unit-3.html">专题 3</a></nav>
+</main>
+<script src="../answers.js"></script>
+</body></html>

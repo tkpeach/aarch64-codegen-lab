@@ -95,5 +95,5 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
     with HTTPServer(("127.0.0.1", args.port), Handler) as server:
-        print(f"http://127.0.0.1:{server.server_port}/learning/checkpoints/P1-C1.html", flush=True)
+        print(f"http://127.0.0.1:{server.server_port}/learning/checkpoints/Unit-1.html", flush=True)
         server.serve_forever()
