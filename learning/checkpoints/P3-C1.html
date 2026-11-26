@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>第 6 天 · 把阶段定位迁移到乘积的消费者</title>
+  <style>
+    :root { color-scheme: light dark; font: 17px/1.75 system-ui, sans-serif; }
+    body { margin: 0; }
+    main { max-width: 46rem; margin: auto; padding: 2rem 1.25rem 4rem; }
+    h1, h2, h3 { line-height: 1.3; }
+    section { margin-top: 2rem; }
+    pre { overflow: auto; padding: .75rem 1rem; background: color-mix(in srgb, CanvasText 7%, Canvas); border-radius: .4rem; }
+    code, pre { font-family: ui-monospace, monospace; }
+    label { display: block; margin: 1.2rem 0 .4rem; font-weight: 650; }
+    textarea { display: block; box-sizing: border-box; width: 100%; min-height: 6rem; padding: .6rem; font: inherit; font-family: ui-monospace, monospace; resize: vertical; }
+    .save-bar { position: sticky; top: 0; padding: .5rem 0; background: Canvas; }
+    button { margin-top: 1.2rem; padding: .5rem .85rem; font: inherit; cursor: pointer; }
+  </style>
+</head>
+<body>
+<main><h1>把阶段定位迁移到乘积的消费者</h1><p>第 6 天 · P3-C1 · LLVM 22.1.8</p><section><h2>机制问题</h2><p><strong>同一乘积交给两个不同的消费者，怎样查明最终运算形态在哪个阶段确定？</strong></p><p>本节产出为两幅数据依赖草图、一份带截点的预测和一条复核路径。</p></section><section><h2>先练习区分两个截点</h2><p>第 3 天的已测宽加法提供了读日志的方法：GlobalISel 在 instruction-select 后有 ADCSXr，在 aarch64-post-select-optimize 后出现 ADCXr。二者都读取 NZCV；后者省去不再需要的标志写入。若只读最终汇编，就无法从这条指令确定变化发生在哪一遍。</p><p>这次回到 SelectionDAG。两个函数都做无溢出标志的 i64 乘法，低 64 位乘积只有一个使用者。先从 IR 画出谁定义结果、谁消费它，再分别预测刚完成选择和最终汇编中的依赖。观察目标指令时连同操作数一起读：固定零寄存器和活跃的累加值有不同的含义。</p></section><section><h2>独立定位与预测</h2><p>完整输入 <a href="../../experiments/day6-multiply.ll">day6-multiply.ll</a></p><pre><code>define i64 @product_sum(i64 %x, i64 %y, i64 %a) {
+  %p = mul i64 %x, %y
+  %r = add i64 %p, %a
+  ret i64 %r
+}
+
+define i64 @product_xor(i64 %x, i64 %y, i64 %a) {
+  %p = mul i64 %x, %y
+  %r = xor i64 %p, %a
+  ret i64 %r
+}</code></pre><p>从 <a href="https://github.com/llvm/llvm-project/blob/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/Target/AArch64/AArch64InstrInfo.td">AArch64InstrInfo.td</a> 搜索乘法的汇编拼写，沿定义或别名找到输入操作数，再到 <a href="https://github.com/llvm/llvm-project/blob/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/Target/AArch64/AArch64InstrInfo.cpp">AArch64InstrInfo.cpp</a> 搜索对应的机器 opcode，检查哪些调用点读写乘积的使用者。先写下你选的符号和理由，再打开输出。</p></section><section><h2>作答后的阶段核对</h2><p>从项目根目录运行。先用 <code>"${LLC:-llc}" --version</code> 核对 22.1.8。脚本固定 Linux AArch64、generic、-O2、SelectionDAG 和机器指令验证器。需要指定工具时先设置 <code>export LLC=/opt/homebrew/opt/llvm@22/bin/llc</code>。</p><pre><code>bash experiments/replay-selection.sh 6</code></pre><p>打开 <code>evidence/day6/selection.txt</code>，按函数名定位选择后的机器基本块，再在同目录 <code>final.s</code> 中找到对应函数。</p><pre><code>&quot;${LLC:-llc}&quot; -mtriple=aarch64-unknown-linux-gnu -mcpu=generic -O2 -global-isel=0 -fast-isel=0 -verify-machineinstrs -filter-print-funcs=product_sum -print-after-all experiments/day6-multiply.ll -o /dev/null 2&gt; evidence/day6/stages.txt</code></pre><p>若两个截点形态不同，在 stages.txt 中找首次满足你的判据的机器基本块，再返回前一个 dump 检查操作数。</p></section><section id="exercise"><h2>集中作答</h2><form id="answers"><div class="save-bar"><span id="save-status" role="status">用 Learning Checkpoint 编辑器打开后按 Cmd+S 保存，或用本地课程服务作答。</span></div>
+<label for="p3-c1-q1">1. 哪条依赖决定能否把两步写成一个算式？</label><p>从两个完整函数各画一条定义→使用链，解释对照所改变的语义。</p>
+<!-- 作答区 -->
+<textarea readonly id="p3-c1-q1" name="p3-c1-q1" rows="5">
+
+</textarea>
+<label for="p3-c1-q2">2. 你预测选择后和最终分别会看到什么？</label><p>按函数与阶段写一个 2×2 表。引用你自己定位的源码符号，指出哪一步仍须通过运行确认。</p>
+<!-- 作答区 -->
+<textarea readonly id="p3-c1-q2" name="p3-c1-q2" rows="5">
+
+</textarea>
+<label for="p3-c1-q3">3. 怎样排除“助记符相似就已融合”？</label><p>给出需要追踪的操作数、阶段顺序以及能推翻预测的具体形态。依据来自上面的宽加法示例和对应机器指令定义。</p>
+<!-- 作答区 -->
+<textarea readonly id="p3-c1-q3" name="p3-c1-q3" rows="5">
+
+</textarea>
+</form></section></main>
+<script src="../answers.js"></script>
+</body></html>

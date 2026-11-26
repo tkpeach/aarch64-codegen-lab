@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>第 7 天 · 把一次指令选择观察交给下一位复验者</title>
+  <style>
+    :root { color-scheme: light dark; font: 17px/1.75 system-ui, sans-serif; }
+    body { margin: 0; }
+    main { max-width: 46rem; margin: auto; padding: 2rem 1.25rem 4rem; }
+    h1, h2, h3 { line-height: 1.3; }
+    section { margin-top: 2rem; }
+    pre { overflow: auto; padding: .75rem 1rem; background: color-mix(in srgb, CanvasText 7%, Canvas); border-radius: .4rem; }
+    code, pre { font-family: ui-monospace, monospace; }
+    label { display: block; margin: 1.2rem 0 .4rem; font-weight: 650; }
+    textarea { display: block; box-sizing: border-box; width: 100%; min-height: 6rem; padding: .6rem; font: inherit; font-family: ui-monospace, monospace; resize: vertical; }
+    .save-bar { position: sticky; top: 0; padding: .5rem 0; background: Canvas; }
+    button { margin-top: 1.2rem; padding: .5rem .85rem; font: inherit; cursor: pointer; }
+  </style>
+</head>
+<body>
+<main><h1>把一次指令选择观察交给下一位复验者</h1><p>第 7 天 · P3-C2 · LLVM 22.1.8</p><section><h2>机制问题</h2><p><strong>下一位读者能否独立复现一条选择结论，并准确找到仍待学习者解释的部分？</strong></p><p>本节产出为一份可交接的短报告与一条尚待回答的问题。</p></section><section><h2>短报告样例 · x + K</h2><p>研究问题是相邻的正整数如何改变加数来源。LLVM 22.1.8、AArch64 Linux、generic、-O2、SelectionDAG 下，K=4096 的选择后指令使用立即数 1 和移位量 12。K=4097 时，常量经寄存器进入 ADDXrr。两份最终汇编分别可见一条立即数加法，以及准备常量再相加。源码阅读入口为 ADD 的 Xri/Xrr 操作数定义。</p><p>从 <a href="https://github.com/llvm/llvm-project/blob/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/Target/AArch64/AArch64InstrInfo.td">AArch64InstrInfo.td</a> 的 <code>defm ADD</code> 跟到 <a href="https://github.com/llvm/llvm-project/blob/ca7933e47d3a3451d81e72ac174dcb5aa28b59d1/llvm/lib/Target/AArch64/AArch64InstrFormats.td">AArch64InstrFormats.td</a> 的 <code>AddSub</code>，比较 Xri 与 Xrr 的输入。沿立即数操作数定义查找移位选择与立即数字段，把字段限制对应到具体 K。</p><p>这个对照支持操作数编码影响所选形态。它能说明这组输入的机器指令依赖；若要声称某种形态执行更快，还需要指定微架构和性能证据。</p><p>从项目根目录运行。先用 <code>"${LLC:-llc}" --version</code> 核对 22.1.8。脚本固定 Linux AArch64、generic、-O2、SelectionDAG 和机器指令验证器。需要指定工具时先设置 <code>export LLC=/opt/homebrew/opt/llvm@22/bin/llc</code>。</p><pre><code>bash experiments/replay-selection.sh 4</code></pre><p>打开 <code>evidence/day4/selection.txt</code>，按函数名定位选择后的机器基本块，再在同目录 <code>final.s</code> 中找到对应函数。</p></section><section><h2>从空事件库续接</h2><p>从项目根目录阅读 notes/README.md 的「Work 历史」。有现成环境时，新的工作副本只需导入一次归档，再读取上下文；日常续接可直接读取上下文。对照工程验证范围与当前检查点 Markdown 的 Status、原答和评价，分别记录下一项工程动作与待答题。</p><pre><code>.venv/bin/repofoundry events import .foundation/events.jsonl --project .
+.venv/bin/repofoundry context --project .</code></pre><p>源码审查任务：从 Xri 的定义追回输出中的两个立即数字段，再让接手者用一条日志定位同一函数。如果只拿到 final.s，说明哪项关于选择阶段的判断失去依据。</p></section><section><h2>交接实测记录</h2><p>在临时目录只复制 project.yaml 和归档 JSONL，使用项目已有的 RepoFoundry 执行一次导入和一次 context。重建的上下文与当前项目逐项相同。新检出时需先按第 1 天笔记准备工具；本次恢复复用了现成环境。常规续接省去导入，只需一次 context 即可取得 Work 和最近证据。</p><p>Work 可直接找出验证范围；学习者对 P2-C1 的逐题原答与反馈仍需打开对应 Markdown。选择后的机器指令保存在忽略的 evidence/ 中，新工作区须从仓库中的 IR 和命令重新生成。仍待检验的问题是：接手者能否仅凭这些入口独立解释一个陌生案例？第 6 天的原答和阶段复核将为此提供证据。</p></section><section id="exercise"><h2>集中作答</h2><form id="answers"><div class="save-bar"><span id="save-status" role="status">用 Learning Checkpoint 编辑器打开后按 Cmd+S 保存，或用本地课程服务作答。</span></div>
+<label for="p3-c2-q1">1. 怎样用最少证据复验结论？</label><p>据样例、源码和 day4 的两个输出，写出环境、命令、一个正例、一个边界反例与选择截点。</p>
+<!-- 作答区 -->
+<textarea readonly id="p3-c2-q1" name="p3-c2-q1" rows="5">
+
+</textarea>
+<label for="p3-c2-q2">2. 接手者如何找到两种进度？</label><p>从 context 的 evidence / unresolved 追到一份学习记录。分别写下工程已验证什么、哪一题还需要谁做什么。</p>
+<!-- 作答区 -->
+<textarea readonly id="p3-c2-q2" name="p3-c2-q2" rows="5">
+
+</textarea>
+<label for="p3-c2-q3">3. 这次接入和续接各需重复什么？</label><p>从索引实际走一遍，记录命令数、最容易定位的证据和一个仍需手工查找的项目。最后提出一项能区分两种解释的后续实验。</p>
+<!-- 作答区 -->
+<textarea readonly id="p3-c2-q3" name="p3-c2-q3" rows="5">
+
+</textarea>
+</form></section></main>
+<script src="../answers.js"></script>
+</body></html>
